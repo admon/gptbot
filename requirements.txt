@@ -1,0 +1,4 @@
+flask
+litellm
+cryptography
+python-dotenv
