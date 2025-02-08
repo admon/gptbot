@@ -8,6 +8,7 @@ import uuid
 import base64
 import litellm
 from dotenv import load_dotenv
+import openai
 
 # Load environment variables
 load_dotenv()
@@ -176,10 +177,62 @@ def get_available_models():
             headers={"Authorization": f"Bearer {master_key}"}
         )
         if response.status_code == 200:
+            # 只返回配置的模型名称（id），而不是原始模型名称
             return [model["id"] for model in response.json()["data"]]
         return []
     except Exception as e:
         logger.error(f"Error getting models: {e}")
+        return []
+
+def get_model_info(detailed=False):
+    """Get information about available models from LiteLLM proxy"""
+    try:
+        master_key = os.getenv("LITELLM_MASTER_KEY")
+        proxy_url = os.getenv("LITELLM_PROXY_URL")
+        
+        response = requests.get(
+            f"{proxy_url}/models",
+            headers={"Authorization": f"Bearer {master_key}"}
+        )
+        
+        if response.status_code == 200:
+            models_data = response.json().get("data", [])
+            if detailed:
+                # 详细信息（用于 /help）
+                models_info = []
+                for model in models_data:
+                    model_id = model.get("id", "")
+                    model_name = model.get("model_name", "")
+                    context_length = model.get("context_length", "Unknown")
+                    pricing = model.get("pricing", {})
+                    
+                    info = f"• {model_id}"
+                    if model_name and model_name != model_id:
+                        info += f" (Base: {model_name})"
+                    if context_length != "Unknown":
+                        info += f" - {context_length} tokens"
+                    if pricing:
+                        input_price = pricing.get("input_price_per_token", 0)
+                        output_price = pricing.get("output_price_per_token", 0)
+                        if input_price or output_price:
+                            info += f"\n  Pricing: ${input_price}/1K input, ${output_price}/1K output"
+                    
+                    models_info.append(info)
+            else:
+                # 简洁信息（用于 /list）
+                models_info = []
+                for model in models_data:
+                    model_id = model.get("id", "")
+                    model_name = model.get("model_name", "")
+                    info = f"• {model_id}"
+                    if model_name and model_name != model_id:
+                        info += f"\n  Original: {model_name}"
+                    models_info.append(info)
+            
+            return models_info
+        return []
+    except Exception as e:
+        logger.error(f"Error getting models info: {e}")
         return []
 
 def handle_command(user_id: str, command: str):
@@ -188,25 +241,54 @@ def handle_command(user_id: str, command: str):
     cmd = parts[0].lower()
 
     if cmd == "/help":
-        available_models = get_available_models()
-        models_text = "\n".join([f"• {model}" for model in available_models])
+        # 获取详细的模型信息
+        models_info = get_model_info(detailed=True)
+        models_text = "\n".join(models_info)
+        current_model = db.get_chat_model(user_id)
         
-        help_text = f"""
-**Available Commands:**
-• `/create` - Create a new LiteLLM proxy key
-• `/show` - Show your current LiteLLM proxy key
-• `/revoke` - Revoke your current proxy key
-• `/usage` - Show your API usage statistics
-• `/ask <question>` - Ask a question to the AI model
-• `/help` - Show this help message
+        message = (
+            "**Available Commands:**\n"
+            "• `/create` - Create a new LiteLLM proxy key\n"
+            "• `/show` - Show your current LiteLLM proxy key\n"
+            "• `/revoke` - Revoke your current proxy key\n"
+            "• `/usage` - Show your API usage statistics\n"
+            "• `/setchat model=<model_name>` - Set your default chat model\n"
+            "• `/list` - List available models (simplified view)\n"
+            "• `/help` - Show this help message\n\n"
+            f"**Your Current Chat Model:** {current_model}\n\n"
+            "**Available Models (Detailed):**\n"
+            f"{models_text}\n\n"
+            "Just type your message directly to chat with the AI!"
+        )
+        send_message(user_id, message, "post")
 
-**Available Models:**
-{models_text}
-
-This bot helps you manage your LiteLLM proxy key and interact with AI models.
-Use any available model with the /ask command by specifying the model name.
-        """
-        send_message(user_id, help_text, "post")
+    elif cmd == "/setchat":
+        if len(parts) < 2 or not parts[1].startswith("model="):
+            # 获取简洁的模型信息用于显示
+            models_info = get_model_info(detailed=False)
+            message = (
+                "Usage: /setchat model=<model_name>\n\n"
+                "Available models:\n"
+                f"{chr(10).join(models_info)}\n\n"
+                "Note: Use the model name (not the Original name) shown above."
+            )
+            send_message(user_id, message, "post")
+            return
+            
+        model = parts[1].split("=")[1]
+        available_models = get_available_models()
+        if model not in available_models:
+            models_info = get_model_info(detailed=False)
+            message = (
+                "Invalid model name. Please choose from:\n"
+                f"{chr(10).join(models_info)}\n\n"
+                "Note: Use the model name (not the Original name) shown above."
+            )
+            send_message(user_id, message, "post")
+            return
+            
+        db.set_chat_model(user_id, model)
+        send_message(user_id, f"Default chat model set to: {model}", "post")
 
     elif cmd == "/create":
         # Check if user already has a key
@@ -307,78 +389,56 @@ _Note: Usage data is updated every few minutes._
         except Exception as e:
             send_message(user_id, f"Error fetching usage statistics. Please try again later or contact administrator if the issue persists.", "post")
 
-    elif cmd == "/ask":
-        if len(parts) < 2:
-            send_message(user_id, "Usage: /ask [model=<model_name>] <your question>", "post")
-            return
-            
-        # Check if model is specified
-        if parts[1].startswith("model="):
-            model = parts[1].split("=")[1]
-            question = " ".join(parts[2:])
-        else:
-            model = DEFAULT_MODEL
-            question = " ".join(parts[1:])
-            
-        key = db.get_api_key(user_id, "litellm")
-        if not key:
-            send_message(user_id, "You don't have a proxy key yet. Use /create to generate one.", "post")
-            return
-            
+    elif cmd == "/list":
         try:
-            litellm.api_key = key
+            # 获取模型信息
+            models_response = requests.get(
+                f"{LITELLM_PROXY_URL}/models",
+                headers={"Authorization": f"Bearer {os.getenv('LITELLM_MASTER_KEY')}"}
+            )
             
-            # 根据不同模型调整请求格式
-            messages = []
-            if "deepseek" in model.lower():
-                messages = [
-                    {"role": "system", "content": "You are a helpful AI assistant that provides accurate and helpful responses."},
-                    {"role": "user", "content": question}
-                ]
-                # 添加 Deepseek 特定参数
-                model_params = {
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": MAX_TOKENS,
-                    "api_base": LITELLM_PROXY_URL,
-                    "temperature": 0.7,
-                    "response_format": {"type": "text"}  # 确保返回文本格式
-                }
-            else:
-                # 默认消息格式（适用于 OpenAI 等模型）
-                messages = [
-                    {"role": "system", "content": "You are a helpful AI assistant."},
-                    {"role": "user", "content": question}
-                ]
-                model_params = {
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": MAX_TOKENS,
-                    "api_base": LITELLM_PROXY_URL
-                }
+            # 添加调试日志
+            logger.info(f"Models API response status: {models_response.status_code}")
+            logger.info(f"Models API response: {models_response.text}")
             
-            # 发送请求
-            response = litellm.completion(**model_params)
+            if models_response.status_code != 200:
+                raise Exception(f"Failed to get models information: {models_response.text}")
             
-            # 处理响应
-            answer = response.choices[0].message.content
-            message_text = f"""
-**Model:** {model}
-**Question:** {question}
-
-**Answer:** {answer}
-            """
-            send_message(user_id, message_text, "post")
+            # 获取当前用户的聊天模型
+            current_model = db.get_chat_model(user_id)
+            logger.info(f"Current model for user {user_id}: {current_model}")
             
-        except litellm.AuthenticationError as e:
-            logger.error(f"Authentication error: {str(e)}")
-            send_message(user_id, "Authentication failed. Please use /create to generate a new API key.", "post")
-        except litellm.BadRequestError as e:
-            logger.error(f"Bad request error: {str(e)}")
-            send_message(user_id, f"Error: The model {model} returned an error. Try another model or rephrase your question.", "post")
+            # 构建模型信息列表
+            models_info = []
+            for model in models_response.json().get("data", []):
+                model_id = model.get("id", "")
+                model_name = model.get("model_name", "")
+                logger.info(f"Processing model: id={model_id}, name={model_name}")
+                
+                # 标记当前使用的模型
+                current_marker = "✓ " if model_id == current_model else "  "
+                
+                # 构建模型信息字符串
+                info = f"{current_marker}• {model_id}"
+                if model_name:
+                    info += f"\n    Original: {model_name}"
+                
+                models_info.append(info)
+                logger.info(f"Added model info: {info}")
+            
+            message = (
+                "**Available Models:**\n"
+                f"{chr(10).join(models_info)}\n\n"
+                "Use `/setchat model=<model_name>` to change your chat model.\n"
+                "Note: Use the model name (not the Original name) when setting the chat model."
+            )
+            
+            logger.info(f"Final message: {message}")
+            send_message(user_id, message, "post")
+            
         except Exception as e:
-            logger.error(f"Error in /ask command: {str(e)}")
-            send_message(user_id, f"Error: {str(e)}", "post")
+            logger.error(f"Error getting models info: {str(e)}")
+            send_message(user_id, f"Error: Failed to get models information. Please try again later.", "post")
 
     else:
         send_message(user_id, "Unknown command. Type /help for available commands.", "post")
@@ -409,6 +469,40 @@ def handle_event():
 
                 if text.startswith("/"):
                     handle_command(sender_id, text)
+                else:
+                    # 处理普通聊天消息
+                    key = db.get_api_key(sender_id, "litellm")
+                    if not key:
+                        send_message(sender_id, "You don't have a proxy key yet. Use /create to generate one.", "post")
+                        return
+                        
+                    try:
+                        model = db.get_chat_model(sender_id)
+                        
+                        # 使用 OpenAI 客户端
+                        client = openai.OpenAI(
+                            api_key=key,
+                            base_url=LITELLM_PROXY_URL
+                        )
+                        
+                        # 发送请求
+                        response = client.chat.completions.create(
+                            model=model,  # 直接使用模型名称
+                            messages=[
+                                {"role": "system", "content": "You are a helpful AI assistant."},
+                                {"role": "user", "content": text}
+                            ],
+                            max_tokens=MAX_TOKENS
+                        )
+                        
+                        answer = response.choices[0].message.content
+                        
+                        # 发送回复
+                        send_message(sender_id, answer, "post")
+                        
+                    except Exception as e:
+                        logger.error(f"Error in chat: {str(e)}")
+                        send_message(sender_id, f"Error: {str(e)}", "post")
 
     except Exception as e:
         logger.error(f"Error handling event: {e}")

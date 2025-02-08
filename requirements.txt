@@ -2,3 +2,4 @@ flask
 litellm
 cryptography
 python-dotenv
+openai>=1.0.0 

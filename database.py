@@ -34,6 +34,10 @@ class APIKeyManager:
                 (user_id TEXT, service TEXT, api_key TEXT,
                 PRIMARY KEY (user_id, service))
             ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS user_settings
+                (user_id TEXT PRIMARY KEY, chat_model TEXT)
+            ''')
             conn.commit()
             conn.close()
 
@@ -94,6 +98,24 @@ class APIKeyManager:
             decrypted_key = self.cipher_suite.decrypt(encrypted_key)
             keys[user_id] = decrypted_key.decode()
         return keys
+
+    def set_chat_model(self, user_id: str, model: str):
+        """Set user's default chat model"""
+        conn = self._get_conn()
+        c = conn.cursor()
+        c.execute('''
+            INSERT OR REPLACE INTO user_settings (user_id, chat_model)
+            VALUES (?, ?)
+        ''', (user_id, model))
+        conn.commit()
+
+    def get_chat_model(self, user_id: str) -> str:
+        """Get user's default chat model"""
+        conn = self._get_conn()
+        c = conn.cursor()
+        c.execute('SELECT chat_model FROM user_settings WHERE user_id = ?', (user_id,))
+        result = c.fetchone()
+        return result[0] if result else os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo")
 
     def __del__(self):
         if hasattr(self, '_local') and hasattr(self._local, 'conn'):
