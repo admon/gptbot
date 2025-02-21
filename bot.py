@@ -477,55 +477,62 @@ def handle_event():
             event = data.get("event", {})
             message = event.get("message", {})
             
-            if message.get("message_type") == "text":
-                content = json.loads(message.get("content", "{}"))
-                text = content.get("text", "").strip()
-                sender_id = event.get("sender", {}).get("sender_id", {}).get("open_id")
+            if message.get("message_type") != "text":
+                return jsonify({"status": "ok"})
+                
+            content = json.loads(message.get("content", "{}"))
+            text = content.get("text", "").strip()
+            sender_id = event.get("sender", {}).get("sender_id", {}).get("open_id")
 
-                if text.startswith("/"):
-                    handle_command(sender_id, text)
+            if text.startswith("/"):
+                handle_command(sender_id, text)
+                return jsonify({"status": "ok"})
+
+            # 处理普通聊天消息
+            key = db.get_api_key(sender_id, "litellm")
+            if not key:
+                send_message(sender_id, "You don't have a proxy key yet. Use /create to generate one.", "post")
+                return jsonify({"status": "ok"})
+            
+            try:
+                model = db.get_chat_model(sender_id)
+                client = openai.OpenAI(
+                    api_key=key,
+                    base_url=LITELLM_PROXY_URL
+                )
+                
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful AI assistant."},
+                        {"role": "user", "content": text}
+                    ],
+                    max_tokens=MAX_TOKENS
+                )
+                
+                answer = response.choices[0].message.content
+                send_message(sender_id, answer, "post")
+                return jsonify({"status": "ok"})
+                
+            except Exception as e:
+                logger.error(f"Error in chat: {str(e)}")
+                error_message = str(e)
+                
+                # 根据错误类型返回更详细的错误信息
+                if "credit balance is too low" in error_message.lower():
+                    error_text = "Error: Your credit balance is too low."
+                elif "rate limit" in error_message.lower():
+                    error_text = "Error: Rate limit exceeded. Please try again later."
+                elif "context length" in error_message.lower():
+                    error_text = "Error: Input text is too long for this model."
                 else:
-                    # 处理普通聊天消息
-                    key = db.get_api_key(sender_id, "litellm")
-                    if not key:
-                        send_message(sender_id, "You don't have a proxy key yet. Use /create to generate one.", "post")
-                        return jsonify({"status": "ok"})
-                        
-                    try:
-                        model = db.get_chat_model(sender_id)
-                        
-                        # 使用 OpenAI 客户端
-                        client = openai.OpenAI(
-                            api_key=key,
-                            base_url=LITELLM_PROXY_URL
-                        )
-                        
-                        # 发送请求
-                        response = client.chat.completions.create(
-                            model=model,
-                            messages=[
-                                {"role": "system", "content": "You are a helpful AI assistant."},
-                                {"role": "user", "content": text}
-                            ],
-                            max_tokens=MAX_TOKENS
-                        )
-                        
-                        answer = response.choices[0].message.content
-                        send_message(sender_id, answer, "post")
-                        
-                    except Exception as e:
-                        logger.error(f"Error in chat: {str(e)}")
-                        # 只发送一次错误消息
-                        error_message = str(e)
-                        if "credit balance is too low" in error_message.lower():
-                            send_message(sender_id, "Error: Your credit balance is too low.", "post")
-                        else:
-                            send_message(sender_id, f"Error: Failed to get response from the model. Please try again later.", "post")
-                        return jsonify({"status": "error", "message": str(e)})
+                    error_text = f"Error: {error_message}"  # 返回原始错误信息
+                
+                send_message(sender_id, error_text, "post")
+                return jsonify({"status": "error", "message": error_message})
 
     except Exception as e:
         logger.error(f"Error handling event: {e}")
-        # 不在这里发送消息，只记录日志
         return jsonify({"status": "error", "message": str(e)})
 
     return jsonify({"status": "ok"})
