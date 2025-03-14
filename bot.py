@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, json
+from flask import Flask, request, jsonify, json, abort
 import logging
 import requests
 import os
@@ -9,6 +9,11 @@ import base64
 import litellm
 from dotenv import load_dotenv
 import openai
+from cachetools import TTLCache
+import hashlib
+import hmac
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 
 # Load environment variables
 load_dotenv()
@@ -17,10 +22,13 @@ app = Flask(__name__)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Also log Flask's werkzeug at DEBUG level
+logging.getLogger('werkzeug').setLevel(logging.DEBUG)
 
 # Initialize configs
 LARK_APP_ID = os.getenv("LARK_APP_ID")
@@ -29,8 +37,19 @@ LITELLM_PROXY_URL = os.getenv("LITELLM_PROXY_URL")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1000"))
 
-# Initialize database
+# Lark Event Subscription configs
+ENCRYPT_KEY = os.getenv("ENCRYPT_KEY", "").strip()
+VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN")
+
+# Validate required configs
+if not ENCRYPT_KEY:
+    logger.error("ENCRYPT_KEY is not set in environment variables")
+    raise ValueError("ENCRYPT_KEY is required")
+
+# Initialize database and message cache
 db = APIKeyManager()
+# Cache to store processed message IDs (10 minute TTL)
+message_cache = TTLCache(maxsize=1000, ttl=600)
 
 def get_tenant_token():
     """Get Lark tenant access token"""
@@ -459,83 +478,232 @@ _Note: Usage data is updated every few minutes._
     else:
         send_message(user_id, "Unknown command. Type /help for available commands.", "post")
 
+def decrypt_data(encrypted_data: str) -> str:
+    """Decrypt data using AES-CBC according to Lark's specification"""
+    try:
+        # Base64 decode the encrypted data
+        encrypted_bytes = base64.b64decode(encrypted_data)
+        
+        # Generate AES key by taking SHA256 hash of ENCRYPT_KEY
+        key = hashlib.sha256(ENCRYPT_KEY.encode('utf-8')).digest()
+        # Use first 16 bytes of encrypted data as IV
+        iv = encrypted_bytes[:16]
+        # Get the actual encrypted content
+        content = encrypted_bytes[16:]
+        
+        logger.debug(f"Decryption key length: {len(key)}")
+        logger.debug(f"IV length: {len(iv)}")
+        logger.debug(f"Content length: {len(content)}")
+        
+        # Create AES cipher in CBC mode
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        # Decrypt and unpad using PKCS7
+        decrypted = unpad(cipher.decrypt(content), AES.block_size)
+        return decrypted.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Error decrypting data: {str(e)}")
+        raise
+
+def verify_signature(timestamp: str, nonce: str, body: bytes, signature: str) -> bool:
+    """Verify the signature of Lark event according to Lark documentation
+    
+    Args:
+        timestamp: X-Lark-Request-Timestamp header
+        nonce: X-Lark-Request-Nonce header
+        body: Raw request body bytes
+        signature: X-Lark-Signature header
+    """
+    try:
+        if not all([timestamp, nonce, body, signature, ENCRYPT_KEY]):
+            logger.error("Missing required parameters for signature verification")
+            return False
+            
+        logger.debug("=== Signature Verification Debug ===")
+        logger.debug(f"Timestamp: {timestamp}")
+        logger.debug(f"Nonce: {nonce}")
+        logger.debug(f"Body length: {len(body)}")
+        logger.debug(f"Raw Signature: {signature}")
+        logger.debug(f"Encrypt Key length: {len(ENCRYPT_KEY)}")
+        
+        # Remove 'sha256=' prefix if present
+        if signature.startswith('sha256='):
+            signature = signature[7:]
+            logger.debug(f"Cleaned Signature: {signature}")
+        
+        # Construct the string to sign according to Lark docs
+        # Format: timestamp + nonce + encrypt_key + body
+        key_bytes = ENCRYPT_KEY.encode('utf-8')
+        timestamp_bytes = timestamp.encode('utf-8')
+        nonce_bytes = nonce.encode('utf-8')
+        
+        # Join all components in bytes
+        string_to_sign = b''.join([timestamp_bytes, nonce_bytes, key_bytes, body])
+        logger.debug(f"String to sign length: {len(string_to_sign)}")
+        
+        # Calculate signature using SHA256
+        calculated_signature = hashlib.sha256(string_to_sign).hexdigest()
+        
+        logger.debug(f"Calculated signature: {calculated_signature}")
+        logger.debug(f"Received signature: {signature}")
+        logger.debug("=== End Debug ===")
+        
+        return hmac.compare_digest(calculated_signature, signature)
+    except Exception as e:
+        logger.error(f"Error in signature verification: {str(e)}")
+        return False
+
 @app.route("/query/message", methods=["POST"])
 def handle_event():
-    # Get request data
-    data = request.get_json()
-    logger.debug(f"Received event: {data}")
-
-    # Handle challenge verification
-    if "challenge" in data:
-        return jsonify({"challenge": data.get("challenge")})
-
+    """Handle Lark event subscription"""
     try:
+        # Get raw request body and headers
+        raw_body = request.get_data()
+        timestamp = request.headers.get("X-Lark-Request-Timestamp")
+        nonce = request.headers.get("X-Lark-Request-Nonce")
+        signature = request.headers.get("X-Lark-Signature")
+        
+        logger.debug("=== Request Debug ===")
+        logger.debug("Headers:")
+        for header, value in request.headers.items():
+            logger.debug(f"{header}: {value}")
+        logger.debug(f"Raw body type: {type(raw_body)}")
+        logger.debug(f"Raw body length: {len(raw_body)}")
+        logger.debug("=== End Request Debug ===")
+        
+        if not all([timestamp, nonce, signature]):
+            logger.error("Missing required headers for verification")
+            abort(401, "Missing required headers")
+        
+        try:
+            # Pass raw body bytes for signature verification
+            if not verify_signature(timestamp, nonce, raw_body, signature):
+                logger.error("Invalid signature")
+                abort(401, "Invalid signature")
+            
+            # After verification, decode body for JSON parsing
+            body = raw_body.decode('utf-8')
+            try:
+                data = json.loads(body)
+                logger.debug(f"Parsed event data: {data}")
+                
+                # Handle encrypted data
+                if "encrypt" in data:
+                    logger.debug("Received encrypted data, decrypting...")
+                    decrypted_data = decrypt_data(data["encrypt"])
+                    data = json.loads(decrypted_data)
+                    logger.debug(f"Decrypted data: {data}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing JSON: {str(e)}")
+                abort(400, "Invalid JSON data")
+            
+            # Only verify token for non-challenge requests
+            if "challenge" not in data:
+                # For v2.0 schema, token is in header.token
+                token = data.get("header", {}).get("token") if data.get("schema") == "2.0" else data.get("token")
+                if token != VERIFICATION_TOKEN:
+                    logger.error(f"Invalid verification token. Expected: {VERIFICATION_TOKEN}, Got: {token}")
+                    abort(401, "Invalid verification token")
+        except Exception as e:
+            logger.error(f"Error during signature verification: {str(e)}")
+            abort(401, "Error during signature verification")
+
+        # Handle challenge verification
+        if "challenge" in data:
+            return jsonify({"challenge": data.get("challenge")})
+            
+        # Extract message ID for deduplication
+        event = data.get("event", {})
+        message = event.get("message", {})
+        message_id = message.get("message_id")
+        
+        # Check if we've already processed this message
+        if message_id:
+            if message_id in message_cache:
+                logger.info(f"Duplicate message detected, skipping: {message_id}")
+                return jsonify({"status": "ok"})
+            message_cache[message_id] = True
+
         header = data.get("header", {})
         event_type = header.get("event_type")
 
-        if event_type == "im.message.receive_v1":
-            event = data.get("event", {})
-            message = event.get("message", {})
-            
-            if message.get("message_type") != "text":
-                return jsonify({"status": "ok"})
-                
-            content = json.loads(message.get("content", "{}"))
-            text = content.get("text", "").strip()
-            sender_id = event.get("sender", {}).get("sender_id", {}).get("open_id")
+        # Only process message events
+        if event_type != "im.message.receive_v1":
+            return jsonify({"status": "ok"})
 
-            if text.startswith("/"):
-                handle_command(sender_id, text)
-                return jsonify({"status": "ok"})
-
-            # 处理普通聊天消息
-            key = db.get_api_key(sender_id, "litellm")
-            if not key:
-                send_message(sender_id, "You don't have a proxy key yet. Use /create to generate one.", "post")
-                return jsonify({"status": "ok"})
+        event = data.get("event", {})
+        message = event.get("message", {})
+        
+        # Only process text messages
+        if message.get("message_type") != "text":
+            return jsonify({"status": "ok"})
             
+        content = json.loads(message.get("content", "{}"))
+        text = content.get("text", "").strip()
+        sender_id = event.get("sender", {}).get("sender_id", {}).get("open_id")
+
+        # Early return if no sender_id
+        if not sender_id:
+            logger.error("No sender_id found in event")
+            return jsonify({"status": "error", "message": "No sender_id found"})
+
+        # Handle command messages
+        if text.startswith("/"):
             try:
-                model = db.get_chat_model(sender_id)
-                client = openai.OpenAI(
-                    api_key=key,
-                    base_url=LITELLM_PROXY_URL
-                )
-                
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": "You are a helpful AI assistant."},
-                        {"role": "user", "content": text}
-                    ],
-                    max_tokens=MAX_TOKENS
-                )
-                
-                answer = response.choices[0].message.content
-                send_message(sender_id, answer, "post")
-                return jsonify({"status": "ok"})
-                
+                handle_command(sender_id, text)
             except Exception as e:
-                logger.error(f"Error in chat: {str(e)}")
-                error_message = str(e)
-                
-                # 根据错误类型返回更详细的错误信息
-                if "credit balance is too low" in error_message.lower():
-                    error_text = "Error: Your credit balance is too low."
-                elif "rate limit" in error_message.lower():
-                    error_text = "Error: Rate limit exceeded. Please try again later."
-                elif "context length" in error_message.lower():
-                    error_text = "Error: Input text is too long for this model."
-                else:
-                    error_text = f"Error: {error_message}"  # 返回原始错误信息
-                
-                send_message(sender_id, error_text, "post")
-                return jsonify({"status": "error", "message": error_message})
+                logger.error(f"Command handling error: {e}")
+                send_message(sender_id, f"Error executing command: {str(e)}", "post")
+            return jsonify({"status": "ok"})
+
+        # Handle chat messages
+        key = db.get_api_key(sender_id, "litellm")
+        if not key:
+            send_message(sender_id, "You don't have a proxy key yet. Use /create to generate one.", "post")
+            return jsonify({"status": "ok"})
+        
+        try:
+            model = db.get_chat_model(sender_id)
+            client = openai.OpenAI(
+                api_key=key,
+                base_url=LITELLM_PROXY_URL
+            )
+            
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful AI assistant."},
+                    {"role": "user", "content": text}
+                ],
+                max_tokens=MAX_TOKENS
+            )
+            
+            answer = response.choices[0].message.content
+            send_message(sender_id, answer, "post")
+            
+        except Exception as e:
+            error_message = str(e).lower()
+            logger.error(f"Chat error: {error_message}")
+            
+            # Map common errors to user-friendly messages
+            error_mapping = {
+                "credit balance is too low": "Your credit balance is too low.",
+                "rate limit": "Rate limit exceeded. Please try again later.",
+                "context length": "Input text is too long for this model."
+            }
+            
+            error_text = "An unexpected error occurred."
+            for key_phrase, message in error_mapping.items():
+                if key_phrase in error_message:
+                    error_text = message
+                    break
+            
+            send_message(sender_id, f"Error: {error_text}", "post")
+
+        return jsonify({"status": "ok"})
 
     except Exception as e:
-        logger.error(f"Error handling event: {e}")
+        logger.error(f"Global error handling event: {e}")
         return jsonify({"status": "error", "message": str(e)})
-
-    return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000) 
