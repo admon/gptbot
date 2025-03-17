@@ -48,8 +48,8 @@ if not ENCRYPT_KEY:
 
 # Initialize database and message cache
 db = APIKeyManager()
-# Cache to store processed message IDs (10 minute TTL)
-message_cache = TTLCache(maxsize=1000, ttl=600)
+# Cache to store processed message IDs (20 minute TTL)
+message_cache = TTLCache(maxsize=1000, ttl=1200)
 
 def get_tenant_token():
     """Get Lark tenant access token"""
@@ -481,11 +481,17 @@ _Note: Usage data is updated every few minutes._
 def decrypt_data(encrypted_data: str) -> str:
     """Decrypt data using AES-CBC according to Lark's specification"""
     try:
+        logger.debug(f"Starting decryption of data: {encrypted_data[:20]}...")
+        logger.debug(f"Using ENCRYPT_KEY (first 4 chars): {ENCRYPT_KEY[:4]}...")
+        
         # Base64 decode the encrypted data
         encrypted_bytes = base64.b64decode(encrypted_data)
+        logger.debug(f"Base64 decoded length: {len(encrypted_bytes)}")
         
         # Generate AES key by taking SHA256 hash of ENCRYPT_KEY
         key = hashlib.sha256(ENCRYPT_KEY.encode('utf-8')).digest()
+        logger.debug(f"SHA256 key (hex): {key.hex()[:16]}...")
+        
         # Use first 16 bytes of encrypted data as IV
         iv = encrypted_bytes[:16]
         # Get the actual encrypted content
@@ -494,12 +500,15 @@ def decrypt_data(encrypted_data: str) -> str:
         logger.debug(f"Decryption key length: {len(key)}")
         logger.debug(f"IV length: {len(iv)}")
         logger.debug(f"Content length: {len(content)}")
+        logger.debug(f"IV (hex): {iv.hex()[:16]}...")
         
         # Create AES cipher in CBC mode
         cipher = AES.new(key, AES.MODE_CBC, iv)
         # Decrypt and unpad using PKCS7
         decrypted = unpad(cipher.decrypt(content), AES.block_size)
-        return decrypted.decode('utf-8')
+        decrypted_text = decrypted.decode('utf-8')
+        logger.debug(f"Successfully decrypted to: {decrypted_text[:100]}")
+        return decrypted_text
     except Exception as e:
         logger.error(f"Error decrypting data: {str(e)}")
         raise
@@ -556,12 +565,8 @@ def verify_signature(timestamp: str, nonce: str, body: bytes, signature: str) ->
 def handle_event():
     """Handle Lark event subscription"""
     try:
-        # Get raw request body and headers
+        # Log request details for debugging
         raw_body = request.get_data()
-        timestamp = request.headers.get("X-Lark-Request-Timestamp")
-        nonce = request.headers.get("X-Lark-Request-Nonce")
-        signature = request.headers.get("X-Lark-Signature")
-        
         logger.debug("=== Request Debug ===")
         logger.debug("Headers:")
         for header, value in request.headers.items():
@@ -570,46 +575,57 @@ def handle_event():
         logger.debug(f"Raw body length: {len(raw_body)}")
         logger.debug("=== End Request Debug ===")
         
+        # Parse JSON data
+        try:
+            body = raw_body.decode('utf-8')
+            data = json.loads(body)
+            logger.debug(f"Parsed request data: {data}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing JSON: {str(e)}")
+            abort(400, "Invalid JSON data")
+            
+        # Handle encrypted data first
+        if "encrypt" in data:
+            logger.debug("Received encrypted data, decrypting...")
+            try:
+                decrypted_data = decrypt_data(data["encrypt"])
+                data = json.loads(decrypted_data)
+                logger.debug(f"Decrypted data: {data}")
+            except Exception as e:
+                logger.error(f"Failed to decrypt data: {e}")
+                abort(400, "Failed to decrypt data")
+            
+        # Handle URL verification challenge - no signature verification needed
+        if "challenge" in data:
+            logger.info("Received URL verification challenge")
+            return jsonify({"challenge": data["challenge"]})
+            
+        # For all other events, verify headers and signature
+        timestamp = request.headers.get("X-Lark-Request-Timestamp")
+        nonce = request.headers.get("X-Lark-Request-Nonce")
+        signature = request.headers.get("X-Lark-Signature")
+        
         if not all([timestamp, nonce, signature]):
             logger.error("Missing required headers for verification")
             abort(401, "Missing required headers")
-        
-        try:
-            # Pass raw body bytes for signature verification
-            if not verify_signature(timestamp, nonce, raw_body, signature):
-                logger.error("Invalid signature")
-                abort(401, "Invalid signature")
             
-            # After verification, decode body for JSON parsing
-            body = raw_body.decode('utf-8')
-            try:
-                data = json.loads(body)
-                logger.debug(f"Parsed event data: {data}")
-                
-                # Handle encrypted data
-                if "encrypt" in data:
-                    logger.debug("Received encrypted data, decrypting...")
-                    decrypted_data = decrypt_data(data["encrypt"])
-                    data = json.loads(decrypted_data)
-                    logger.debug(f"Decrypted data: {data}")
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing JSON: {str(e)}")
-                abort(400, "Invalid JSON data")
+        # Verify signature
+        if not verify_signature(timestamp, nonce, raw_body, signature):
+            logger.error("Invalid signature")
+            abort(401, "Invalid signature")
             
-            # Only verify token for non-challenge requests
-            if "challenge" not in data:
-                # For v2.0 schema, token is in header.token
-                token = data.get("header", {}).get("token") if data.get("schema") == "2.0" else data.get("token")
-                if token != VERIFICATION_TOKEN:
-                    logger.error(f"Invalid verification token. Expected: {VERIFICATION_TOKEN}, Got: {token}")
-                    abort(401, "Invalid verification token")
-        except Exception as e:
-            logger.error(f"Error during signature verification: {str(e)}")
-            abort(401, "Error during signature verification")
-
-        # Handle challenge verification
-        if "challenge" in data:
-            return jsonify({"challenge": data.get("challenge")})
+        # Handle encrypted data if present
+        if "encrypt" in data:
+            logger.debug("Received encrypted data, decrypting...")
+            decrypted_data = decrypt_data(data["encrypt"])
+            data = json.loads(decrypted_data)
+            logger.debug(f"Decrypted data: {data}")
+            
+        # For v2.0 schema, token is in header.token
+        token = data.get("header", {}).get("token") if data.get("schema") == "2.0" else data.get("token")
+        if token != VERIFICATION_TOKEN:
+            logger.error(f"Invalid verification token. Expected: {VERIFICATION_TOKEN}, Got: {token}")
+            abort(401, "Invalid verification token")
             
         # Extract message ID for deduplication
         event = data.get("event", {})
